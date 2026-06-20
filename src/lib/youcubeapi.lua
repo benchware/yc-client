@@ -582,10 +582,7 @@ local function play_vid(buffer, force_fps, string_unpack)
     while true do
         frame_count = frame_count + 1
         
-        -- Speaker Buffer Throttling: halt if audio thread is stalled
-        while _G.youcube_audio_stalled do
-            sleep(0.05)
-        end
+
         
         local frame
         if first then
