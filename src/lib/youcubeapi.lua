@@ -102,7 +102,7 @@ function API:detect_bestest_server(_server, _verbose)
                 print(websocket_error)
             end
         elseif i == #servers then
-            error(err)
+            error(err .. "\n(Verify 'allowed_domains'/'blocked_domains' in config/computercraft-common.toml)")
         elseif _verbose then
             print(err)
         end
