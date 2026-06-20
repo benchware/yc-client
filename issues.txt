@@ -1,0 +1,84 @@
+========================================================================
+         YOUCUBE CLIENT - AUDIO/VIDEO REALTIME DESYNC FIXES          
+========================================================================
+
+Dealing with audio and video drifting apart mid-song is a massive 
+headache in ComputerCraft. Because Lua is single-threaded, if a network 
+hiccup or rendering spike happens, the screen and speakers lose track 
+of each other instantly. 
+
+Here is what we need to adjust in our fork to fix real-time drift:
+
+------------------------------------------------------------------------
+1. CLIENT-SIDE (LUA) TIMESTAMPING & TICK SYNC
+------------------------------------------------------------------------
+[ ] Implement a Master "Sync Clock" Loop
+    - EXPLANATION: Right now, the client plays video frames sequentially 
+      using basic timers (like 'os.startTimer'). If a frame takes too 
+      long to draw, it falls behind, but the audio carries on blindly.
+    - THE FIX: Rewrite the video loop in 'src/player.lua'. Instead of 
+      just waiting "X milliseconds" between frames, check the current 
+      audio playback timestamp from the speaker peripheral. Match the 
+      video frame to that exact timestamp. If a frame is late, skip it!
+
+[ ] Drop Late Frames Automatically (Frame Skipping)
+    - EXPLANATION: If Minecraft experiences a server lag spike, the Lua 
+      virtual machine freezes. When it wakes up, it tries to render 
+      all the missed video frames one-by-one, destroying real-time sync.
+    - THE FIX: Add a simple catch-up condition:
+      'if current_time > frame_target_time + 0.1 then skip_frame()'
+      It's better to have a tiny visual stutter than a permanent desync.
+
+------------------------------------------------------------------------
+2. SERVER-SIDE (PYTHON / FFMPEG) TRANSCODING TWEAKS
+------------------------------------------------------------------------
+[ ] Lock Video and Audio Timestamps at the Server Level
+    - EXPLANATION: The backend server handles the heavy lifting via 
+      FFmpeg and sanjuuni. If the source YouTube video has variable 
+      framerate (VFR), the extracted audio track length won't perfectly 
+      match the total count of converted video frames.
+    - THE FIX: In the backend 'CC-YouCube/server' Python scripts, force 
+      FFmpeg to output a strictly Constant Framerate (CFR) using flags:
+      '-vsync cfr' or '-r 10' (or whatever standard FPS the player targets).
+
+[ ] Equalize Chunk Buffering Sizes
+    - EXPLANATION: The backend streams audio data and video packets down 
+      to the in-game computer in chunks. If the audio buffer is huge 
+      but the video chunk sizes are tiny, they will never arrive in-game 
+      at the same instant.
+    - THE FIX: Align the chunk output in the streaming logic so that 1 
+      second of audio payload always matches 1 second worth of video 
+      frame data in the network packet stream.
+
+------------------------------------------------------------------------
+3. NETWORK HANDLING & BUFFER THROTTLING
+------------------------------------------------------------------------
+[ ] Add an In-Game Pre-Buffer Period
+    - EXPLANATION: When a video starts playing immediately upon receiving 
+      the first packet, any minor network jitter causes the video to pause 
+      while the audio hardware buffer keeps humming along.
+    - THE FIX: Modify the playback state machine to wait until at least 
+      2 or 3 seconds of both audio and video data are saved locally 
+      in the computer's memory before firing up the display and speakers.
+
+[ ] Throttle Video Thread During Speaker Fatigue
+    - EXPLANATION: CC: Tweaked speaker peripherals have a strict internal 
+      buffer limit (usually 128k audio samples). If the Lua thread pumps 
+      too much audio too quickly, it receives a 'false' return from 
+      'speaker.playAudio()', pausing the audio while the video loops 
+      careen ahead.
+    - THE FIX: Wrap the speaker output in a loop that checks if the 
+      buffer is full. If it is full, use 'os.pullEvent("speaker_audio_empty")' 
+      to pause the entire video renderer until the audio catch up.
+
+------------------------------------------------------------------------
+4. SUMMARY & TESTING PLAN
+------------------------------------------------------------------------
+Once these patches are written:
+1. Spin up the custom backend server and double-check FFmpeg outputs.
+2. Update the in-game client config to look at the custom backend URL.
+3. Use a heavy, high-framerate video to test the frame-skipping logic.
+4. If frames are dropping but the audio sounds completely uninterrupted 
+   and aligned, the desync issue is officially fixed!
+
+========================================================================
