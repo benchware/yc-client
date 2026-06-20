@@ -31,19 +31,19 @@ end
 
 -- Look at the [Documentation](https://commandcracker.github.io/YouCube/) for moor information
 -- Contact the server owner on Discord, when the server is down
-local servers = {
-    "ws://127.0.0.1:5000", -- Your server!
-    "wss://us-ky.youcube.knijn.one", -- By EmmaKnijn
-    "wss://youcube.knijn.one", -- By EmmaKnijn
-    "wss://youcube.onrender.com", -- By Commandcracker#8528
-}
+local servers = {}
 
 if settings then
     local server = settings.get("youcube.server")
     if server then
-        table.insert(servers, 1, server)
+        table.insert(servers, server)
+    else
+        table.insert(servers, "ws://127.0.0.1:5000")
     end
+else
+    table.insert(servers, "ws://127.0.0.1:5000")
 end
+
 
 local function websocket_with_timeout(_url, _headers, _timeout)
     if http.websocketAsync then
@@ -87,7 +87,7 @@ function API:detect_bestest_server(_server, _verbose)
             if _verbose then
                 print("Trying to connect to:", server)
             end
-            local websocket, websocket_error = websocket_with_timeout(server, nil, 5)
+            local websocket, websocket_error = websocket_with_timeout(server, nil, 30)
 
             if websocket ~= false then
                 term.write("Using the YouCube server: ")
@@ -309,9 +309,27 @@ function Speaker.new(speaker)
 
     function self:write(chunk)
         local buffer = decoder(chunk)
-        while not self.speaker.playAudio(buffer, self.volume) do
-            os.pullEvent("speaker_audio_empty")
+        
+        -- Initialize audio clock on first write
+        if not _G.youcube_audio_start_epoch then
+            _G.youcube_audio_start_epoch = os.epoch("utc")
+            _G.youcube_total_samples_queued = 0
+            _G.youcube_audio_stalled = false
         end
+        
+        if not self.speaker.playAudio(buffer, self.volume) then
+            _G.youcube_audio_stalled = true
+            while not self.speaker.playAudio(buffer, self.volume) do
+                os.pullEvent("speaker_audio_empty")
+            end
+            _G.youcube_audio_stalled = false
+            -- Since we stalled, the speaker buffer is completely empty now.
+            -- Adjust start epoch so played time matches samples queued so far.
+            local elapsed_played_time = _G.youcube_total_samples_queued / 48000 * 1000
+            _G.youcube_audio_start_epoch = os.epoch("utc") - elapsed_played_time
+        end
+        
+        _G.youcube_total_samples_queued = _G.youcube_total_samples_queued + #buffer
     end
 
     return self
@@ -437,10 +455,15 @@ function VideoFiller.new(youcubeapi, id, width, height)
 
     function self:next()
         local response = self.youcubeapi:get_vid(self.tracker, self.id, self.width, self.height)
+        local lines = {}
         for i = 1, #response.lines do
-            self.tracker = self.tracker + #response.lines[i] + 1
+            local line = response.lines[i]
+            if line ~= "" then
+                self.tracker = self.tracker + #line + 1
+                table.insert(lines, line)
+            end
         end
-        return response.lines
+        return lines
     end
 
     return self
@@ -512,10 +535,21 @@ end
     and [sanjuuni/websocket-player.lua](https://github.com/MCJack123/sanjuuni/blob/30dcabb4b56f1eb32c88e1bce384b0898367ebda/websocket-player.lua)
     @tparam Buffer buffer filled with frames
 ]]
+local function get_audio_time()
+    if not _G.youcube_audio_start_epoch or not _G.youcube_total_samples_queued then
+        return nil
+    end
+    local elapsed = (os.epoch("utc") - _G.youcube_audio_start_epoch) / 1000
+    local played_samples = math.min(_G.youcube_total_samples_queued, 48000 * elapsed)
+    return played_samples / 48000
+end
+
 local function play_vid(buffer, force_fps, string_unpack)
     if not string_unpack then
         string_unpack = string.unpack
     end
+    
+    -- Dynamically recalculate monitor dimensions at the precise moment playback starts
     local Fwidth, Fheight = term.getSize()
     local tracker = 0
 
@@ -538,75 +572,144 @@ local function play_vid(buffer, force_fps, string_unpack)
     end
     term.clear()
 
+    -- Reset global audio clock at playback start
+    _G.youcube_audio_start_epoch = nil
+    _G.youcube_total_samples_queued = nil
+    _G.youcube_audio_stalled = false
+
     local start = os.epoch("utc")
     local frame_count = 0
     while true do
         frame_count = frame_count + 1
+        
+        -- Speaker Buffer Throttling: halt if audio thread is stalled
+        while _G.youcube_audio_stalled do
+            sleep(0.05)
+        end
+        
         local frame
         if first then
             frame, first = first, nil
         elseif second then
             frame, second = second, nil
         else
+            -- Check for empty buffer - show "Still Loading..." passive indicator
+            if #buffer.buffer == 0 then
+                local w, h = term.getSize()
+                term.setCursorPos(math.floor((w - 16) / 2) + 1, math.floor(h / 2) + 1)
+                term.setTextColor(colors.yellow)
+                term.write("Still Loading...")
+                
+                local timeout = 100 -- 10 seconds timeout (100 * 0.1s)
+                while #buffer.buffer == 0 and timeout > 0 do
+                    sleep(0.1)
+                    timeout = timeout - 1
+                end
+                
+                if #buffer.buffer == 0 then
+                    -- Timeout reached, assume stream ended
+                    break
+                end
+            end
             frame = buffer:next()
         end
+        
         if frame == "" or frame == nil then
             break
         end
-        local mode = frame:match("^!CP([CD])")
-        if not mode then
-            error("Invalid file")
-        end
-        local b64data
-        if mode == "C" then
-            local len = tonumber(frame:sub(5, 8), 16)
-            b64data = frame:sub(9, len + 8)
+
+        -- Calculate frame time and check master clock
+        local target_time = (frame_count - 1) / fps
+        local current_time = get_audio_time() or ((os.epoch("utc") - start) / 1000)
+
+        -- Frame skipping catch-up logic
+        if fps > 0 and current_time > target_time + 0.1 then
+            -- Frame is late by more than 0.1s. Skip rendering.
         else
-            local len = tonumber(frame:sub(5, 16), 16)
-            b64data = frame:sub(17, len + 16)
-        end
-        local data = Base64.decode(b64data)
-        -- TODO: maybe verify checksums?
-        assert(data:sub(1, 4) == "\0\0\0\0" and data:sub(9, 16) == "\0\0\0\0\0\0\0\0", "Invalid file")
-        local width, height = string_unpack("HH", data, 5)
-        local c, n, pos = string_unpack("c1B", data, 17)
-        local text = {}
-        for y = 1, height do
-            text[y] = ""
-            for x = 1, width do
-                text[y] = text[y] .. c
-                n = n - 1
-                if n == 0 then
-                    c, n, pos = string_unpack("c1B", data, pos)
+            -- Wait until it is time to render this frame
+            if fps > 0 then
+                while current_time < target_time do
+                    sleep(0.01)
+                    current_time = get_audio_time() or ((os.epoch("utc") - start) / 1000)
                 end
             end
-        end
-        c = c:byte()
-        for y = 1, height do
-            local fg, bg = "", ""
-            for x = 1, width do
-                fg, bg = fg .. ("%x"):format(bit32.band(c, 0x0F)), bg .. ("%x"):format(bit32.rshift(c, 4))
-                n = n - 1
-                if n == 0 then
-                    c, n, pos = string_unpack("BB", data, pos)
+
+            -- Decode and render
+            local mode = frame:match("^!CP([CD])")
+            if not mode then
+                error("Invalid file")
+            end
+            local b64data
+            if mode == "C" then
+                local len = tonumber(frame:sub(5, 8), 16)
+                b64data = frame:sub(9, len + 8)
+            else
+                local len = tonumber(frame:sub(5, 16), 16)
+                b64data = frame:sub(17, len + 16)
+            end
+            local data = Base64.decode(b64data)
+            assert(data:sub(1, 4) == "\0\0\0\0" and data:sub(9, 16) == "\0\0\0\0\0\0\0\0", "Invalid file")
+            local width, height = string_unpack("HH", data, 5)
+            local c, n, pos = string_unpack("c1B", data, 17)
+            local text = {}
+            for y = 1, height do
+                text[y] = ""
+                for x = 1, width do
+                    text[y] = text[y] .. c
+                    n = n - 1
+                    if n == 0 then
+                        c, n, pos = string_unpack("c1B", data, pos)
+                    end
                 end
             end
-            term.setCursorPos(1, y)
-            term.blit(text[y], fg, bg)
+            c = c:byte()
+            
+            -- Recalculate offsets dynamically to prevent stretching/cutting and center the video
+            local offsetX = math.max(0, math.floor((Fwidth - width) / 2))
+            local offsetY = math.max(0, math.floor((Fheight - height) / 2))
+            
+            for y = 1, height do
+                local fg, bg = "", ""
+                for x = 1, width do
+                    fg, bg = fg .. ("%x"):format(bit32.band(c, 0x0F)), bg .. ("%x"):format(bit32.rshift(c, 4))
+                    n = n - 1
+                    if n == 0 then
+                        c, n, pos = string_unpack("BB", data, pos)
+                    end
+                end
+                
+                -- Render row centered and clipped to screen
+                if offsetY + y <= Fheight and offsetY + y > 0 then
+                    term.setCursorPos(offsetX + 1, offsetY + y)
+                    local draw_text = text[y]
+                    local draw_fg = fg
+                    local draw_bg = bg
+                    if offsetX + width > Fwidth then
+                        local max_len = Fwidth - offsetX
+                        if max_len > 0 then
+                            draw_text = draw_text:sub(1, max_len)
+                            draw_fg = draw_fg:sub(1, max_len)
+                            draw_bg = draw_bg:sub(1, max_len)
+                        else
+                            draw_text = ""
+                        end
+                    end
+                    if #draw_text > 0 then
+                        term.blit(draw_text, draw_fg, draw_bg)
+                    end
+                end
+            end
+            pos = pos - 2
+            local r, g, b
+            for i = 0, 15 do
+                r, g, b, pos = string_unpack("BBB", data, pos)
+                term.setPaletteColor(2 ^ i, r / 255, g / 255, b / 255)
+            end
         end
-        pos = pos - 2
-        local r, g, b
-        for i = 0, 15 do
-            r, g, b, pos = string_unpack("BBB", data, pos)
-            term.setPaletteColor(2 ^ i, r / 255, g / 255, b / 255)
-        end
+
         if fps == 0 then
             read()
             break
-        else
-            while os.epoch("utc") < start + (frame_count + 1) / fps * 1000 do
-                sleep(1 / fps)
-            end
         end
     end
     reset_term()

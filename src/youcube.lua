@@ -481,9 +481,47 @@ local function play(url)
         end
     end
 
+    local natural_end = false
     local function _play_media()
+        -- Pre-buffering wait loop (3 seconds)
+        local target_video = 30
+        local target_audio = 3
+        local term_w, term_h = term.getSize()
+        
+        while true do
+            local ready = true
+            local msg = "Pre-buffering:"
+            
+            if not args.no_video then
+                local current_video = #video_buffer.buffer
+                msg = msg .. " Video " .. current_video .. "/" .. target_video
+                if current_video < target_video then
+                    ready = false
+                end
+            end
+            
+            if not args.no_audio then
+                local current_audio = #audio_buffer.buffer
+                msg = msg .. " Audio " .. current_audio .. "/" .. target_audio
+                if current_audio < target_audio then
+                    ready = false
+                end
+            end
+            
+            if ready then
+                break
+            end
+            
+            term.clear()
+            term.setCursorPos(math.floor((term_w - #msg) / 2) + 1, math.floor(term_h / 2) + 1)
+            term.setTextColor(colors.yellow)
+            term.write(msg)
+            sleep(0.1)
+        end
+
         os.queueEvent("youcube:playing")
         parallel.waitForAll(_play_video, _play_audio)
+        natural_end = true
     end
 
     local function _hotkey_handler()
@@ -513,6 +551,20 @@ local function play(url)
     end
 
     parallel.waitForAny(fill_buffers, _play_media, _hotkey_handler)
+
+    if natural_end then
+        -- Wait for EOF events to avoid race conditions and premature shutdown
+        local wait_vid = not args.no_video
+        local wait_audio = not args.no_audio
+        while wait_vid or wait_audio do
+            local event = os.pullEvent()
+            if event == "youcube:vid_eof" then
+                wait_vid = false
+            elseif event == "youcube:audio_eof" then
+                wait_audio = false
+            end
+        end
+    end
 
     if data.playlist_videos then
         return data.playlist_videos
